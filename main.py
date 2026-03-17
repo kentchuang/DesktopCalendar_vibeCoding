@@ -7,6 +7,16 @@ from datetime import datetime, date, timedelta
 import threading
 from PIL import Image, ImageDraw
 import pystray
+import logging
+
+# ── Logging Configuration ──────────────────────────────────────────────────────
+logging.basicConfig(
+    filename='app.log',
+    level=logging.ERROR,  # 僅在發生 Exception 時記錄
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    encoding='utf-8'
+)
+logger = logging.getLogger(__name__)
 
 # ── Windows API ────────────────────────────────────────────────────────────────
 WS_EX_TRANSPARENT = 0x00000020
@@ -544,8 +554,9 @@ class DesktopCalendar:
         # 將視窗屬性設定為 toolwindow，這會隱藏掉 Taskbar 上的圖示
         self.root.wm_attributes("-toolwindow", True)  
 
-        self.data_path = "tasks.json"
-        
+        # 資料路徑改為 .config 以降低防毒軟體誤報
+        self.data_path = "tasks.config"
+        self.old_data_path = "tasks.json"
         # 依照 JSON 檔案載入上次保存的位置或記事資料
         self.load_data()
         # 基於載入的設定，計算與初始化目前的 UI 色票組合
@@ -637,31 +648,49 @@ class DesktopCalendar:
         """
         嘗試從磁碟讀取 user 配置與記事紀錄 (JSON 格式)。
         若檔案不存在則套用預設值 (預設透明度 0.6、視窗大小 450x550)。
+        同時處理從舊版 tasks.json 遷移至新版 tasks.config 的邏輯。
         """
-        if os.path.exists(self.data_path):
-            with open(self.data_path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
-        else:
-            self.data = {"settings": {"bg_color": "#3c7ea1",
-                                      "opacity": 0.6, "edit_opacity": 0.9,
-                                      "pos_x": 100, "pos_y": 100,
-                                      "width": 450, "height": 550}, "tasks": {}}
-        self.settings = self.data.get("settings", {})
-        self.tasks    = self.data.get("tasks",    {})
+        try:
+            # 自動遷移舊版資料
+            if not os.path.exists(self.data_path) and os.path.exists(self.old_data_path):
+                # 遷移仍保留此 INFO，因為這屬於重要的一次性系統行為轉變
+                logger.warning(f"正在遷移舊版資料檔 {self.old_data_path} -> {self.data_path}")
+                os.rename(self.old_data_path, self.data_path)
+
+            if os.path.exists(self.data_path):
+                with open(self.data_path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+            else:
+                self.data = {"settings": {"bg_color": "#3c7ea1",
+                                          "opacity": 0.6, "edit_opacity": 0.9,
+                                          "pos_x": 100, "pos_y": 100,
+                                          "width": 450, "height": 550}, "tasks": {}}
+            self.settings = self.data.get("settings", {})
+            self.tasks    = self.data.get("tasks",    {})
+        except Exception as e:
+            logger.error(f"載入資料失敗: {e}", exc_info=True)
+            messagebox.showerror("錯誤", f"無法載入資料檔案: {e}\n詳情請見 app.log")
+            # 發生嚴重錯誤時給予空資料夾
+            self.data = {"settings": {}, "tasks": {}}
+            self.settings = {}
+            self.tasks = {}
 
     def save_data(self):
         """
         寫入使用者的變更。
         包含目前的視窗位置 (pos_x, pos_y) 與縮放大小，以及行事曆內的記事。
         """
-        self.settings["pos_x"]  = self.root.winfo_x()
-        self.settings["pos_y"]  = self.root.winfo_y()
-        self.settings["width"]  = self.root.winfo_width()
-        self.settings["height"] = self.root.winfo_height()
-        self.data["settings"] = self.settings
-        self.data["tasks"]    = self.tasks
-        with open(self.data_path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        try:
+            self.settings["pos_x"]  = self.root.winfo_x()
+            self.settings["pos_y"]  = self.root.winfo_y()
+            self.settings["width"]  = self.root.winfo_width()
+            self.settings["height"] = self.root.winfo_height()
+            self.data["settings"] = self.settings
+            self.data["tasks"]    = self.tasks
+            with open(self.data_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"儲存資料失敗: {e}", exc_info=True)
 
     # ── Window ────────────────────────────────────────────────────────────────
 
