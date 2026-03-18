@@ -10,6 +10,7 @@ import pystray
 import sys
 import logging
 import winreg
+import subprocess
 
 # ── Logging Configuration ──────────────────────────────────────────────────────
 def get_base_dir():
@@ -463,7 +464,7 @@ class SettingsDialog(tk.Toplevel):
 
         self._section("啟動選項", "")
         self.autostart_var = tk.BooleanVar(value=settings.get("autostart", False))
-        cb = tk.Checkbutton(self, text="開機時自動啟動 (需要寫入登錄檔)",
+        cb = tk.Checkbutton(self, text="開機時自動啟動 (將捷徑加入啟動資料夾)",
                             variable=self.autostart_var,
                             bg="#2e5f7a", fg="white", selectcolor="#3c7ea1",
                             activebackground="#2e5f7a", activeforeground="white",
@@ -617,9 +618,12 @@ class DesktopCalendar:
             self.root.update_idletasks()
             logger.info("DesktopCalendar 初始化完成。")
             
-            # 初始化時同步一次登錄檔 (確保位置正確)
+            # 初始化時同步一次啟動設定 (從登錄檔遷移到啟動資料夾)
             if self.settings.get("autostart", False):
-                self._update_autostart_registry(True)
+                self._update_autostart_shortcut(True)
+            else:
+                # 確保舊的登錄檔項目被移除 (一次性清理)
+                self._cleanup_old_registry_task()
             
             # 強制全面更新，解決 Win7 部分元件需要 hover 才出現的問題
             self.root.update()
@@ -675,26 +679,52 @@ class DesktopCalendar:
         # Re-apply desktop z-order
         self.apply_desktop_layer()
 
-    def _update_autostart_registry(self, enable):
-        """更新 Windows 登錄檔啟動項目"""
+    def _cleanup_old_registry_task(self):
+        """一次性清理舊版的登錄檔啟動項目"""
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         app_name = "DesktopCalendar"
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+            try:
+                winreg.DeleteValue(key, app_name)
+                logger.info("已成功清理舊版登錄檔啟動項目")
+            except FileNotFoundError:
+                pass
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+    def _update_autostart_shortcut(self, enable):
+        """將程式捷徑加入或移除「啟動」資料夾"""
+        startup_dir = os.path.join(os.environ['APPDATA'], r'Microsoft\Windows\Start Menu\Programs\Startup')
+        shortcut_path = os.path.join(startup_dir, "DesktopCalendar.lnk")
+        
+        try:
             if enable:
                 # 取得目前執行檔的絕對路徑
-                exe_path = os.path.abspath(sys.executable)
-                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
-                logger.info(f"已加入開機啟動登錄檔: {exe_path}")
+                if getattr(sys, 'frozen', False):
+                    target_exe = sys.executable
+                else:
+                    target_exe = os.path.abspath(__file__)
+                
+                # 使用 PowerShell 建立捷徑 (避免依賴第三方庫)
+                ps_command = (
+                    f'$s=(New-Object -ComObject WScript.Shell).CreateShortcut("{shortcut_path}");'
+                    f'$s.TargetPath="{target_exe}";'
+                    f'$s.WorkingDirectory="{os.path.dirname(target_exe)}";'
+                    f'$s.Save()'
+                )
+                subprocess.run(['powershell', '-Command', ps_command], capture_output=True, check=True)
+                logger.info(f"已建立啟動捷徑: {shortcut_path} -> {target_exe}")
+                
+                # 同時清理舊的登錄檔項目
+                self._cleanup_old_registry_task()
             else:
-                try:
-                    winreg.DeleteValue(key, app_name)
-                    logger.info("已移除開機啟動登錄檔項目")
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
+                if os.path.exists(shortcut_path):
+                    os.remove(shortcut_path)
+                    logger.info(f"已移除啟動捷徑: {shortcut_path}")
         except Exception as e:
-            logger.error(f"更新登錄檔失敗: {e}", exc_info=True)
+            logger.error(f"更新啟動捷徑失敗: {e}", exc_info=True)
 
     def apply_settings(self):
         """套用設定對話框回傳的新數值並儲存至磁碟。"""
@@ -709,7 +739,7 @@ class DesktopCalendar:
         
         self.save_data()
         self.draw_calendar()
-        self._update_autostart_registry(self.settings.get("autostart", False))
+        self._update_autostart_shortcut(self.settings.get("autostart", False))
 
     # ── Theme ─────────────────────────────────────────────────────────────────
 
