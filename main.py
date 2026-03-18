@@ -7,14 +7,27 @@ from datetime import datetime, date, timedelta
 import threading
 from PIL import Image, ImageDraw
 import pystray
+import sys
 import logging
+import winreg
 
 # ── Logging Configuration ──────────────────────────────────────────────────────
+def get_base_dir():
+    """取得執行檔或腳本所在的目錄"""
+    if getattr(sys, 'frozen', False):
+        # 如果是經過 PyInstaller 封裝的執行檔
+        return os.path.dirname(sys.executable)
+    # 如果是直接執行 Python 腳本
+    return os.path.dirname(os.path.abspath(__file__))
+
+log_path = os.path.join(get_base_dir(), 'app.log')
+
+# 使用 FileHandler 以支援 Python 3.8 的 encoding 設定
+log_handler = logging.FileHandler(log_path, encoding='utf-8')
 logging.basicConfig(
-    filename='app.log',
     level=logging.ERROR,  # 僅在發生 Exception 時記錄
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
-    encoding='utf-8'
+    handlers=[log_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -400,16 +413,21 @@ class NoteDialog(tk.Toplevel):
         將 Text 編輯器裡的內容逐行掃描，連同其附帶的格式標籤，打包組裝為 {"lines": [...]} 字典。
         將結果賦予 self.result 後銷毀視窗，讓呼叫方接手處理。
         """
-        total = int(self.text.index(tk.END).split(".")[0])
-        lines_data = []
-        for i in range(1, total + 1):
-            txt = self.text.get(f"{i}.0", f"{i}.end").strip()
-            if not txt:
-                continue
-            fmt = self._get_line_format(i)
-            lines_data.append({"text": txt, **fmt})
-        self.result = {"lines": lines_data}
-        self.destroy()
+        try:
+            total = int(self.text.index(tk.END).split(".")[0])
+            lines_data = []
+            for i in range(1, total + 1):
+                txt = self.text.get(f"{i}.0", f"{i}.end").strip()
+                if not txt:
+                    continue
+                fmt = self._get_line_format(i)
+                lines_data.append({"text": txt, **fmt})
+            self.result = {"lines": lines_data}
+            logger.info(f"記事對話框已準備好結果: {len(lines_data)} 行")
+            self.destroy()
+        except Exception as e:
+            logger.error(f"對話框 on_save 失敗: {e}", exc_info=True)
+            messagebox.showerror("錯誤", f"儲存過程發生問題: {e}")
 
 
 # ── Settings Dialog ────────────────────────────────────────────────────────────
@@ -432,15 +450,26 @@ class SettingsDialog(tk.Toplevel):
         self._preview_color     = self._orig_bg
 
         self.title("設定")
-        self.geometry("380x450")
+        self.geometry("400x550")
         self.resizable(False, False)
         self.configure(bg="#2e5f7a")
         self.grab_set()
         self.lift()
-
+        
+        logger.info("正在建立設定對話框介面...")
         self._section("透明度", "30%~100%")
         self.edit_var = tk.DoubleVar(value=self._orig_edit_opacity)
         self._slider_row(self.edit_var, 0.3, 1.0, self._on_change)
+
+        self._section("啟動選項", "")
+        self.autostart_var = tk.BooleanVar(value=settings.get("autostart", False))
+        cb = tk.Checkbutton(self, text="開機時自動啟動 (需要寫入登錄檔)",
+                            variable=self.autostart_var,
+                            bg="#2e5f7a", fg="white", selectcolor="#3c7ea1",
+                            activebackground="#2e5f7a", activeforeground="white",
+                            font=("Microsoft JhengHei", 10))
+        cb.pack(anchor="w", padx=20, pady=2)
+        logger.debug(f"啟動選項狀態: {self.autostart_var.get()}")
 
         self._section("日曆底色", "")
         color_row = tk.Frame(self, bg="#2e5f7a")
@@ -528,6 +557,7 @@ class SettingsDialog(tk.Toplevel):
     def _apply(self):
         self.settings["edit_opacity"] = round(self.edit_var.get(), 2)
         self.settings["bg_color"]     = self._preview_color
+        self.settings["autostart"]    = self.autostart_var.get()
         self.on_apply_cb()
         self.destroy()
 
@@ -549,39 +579,69 @@ class DesktopCalendar:
         """
         初始化主程式系統狀態並建立 UI 元件。
         """
-        self.root = root
-        self.root.title("DesktopCalendar")
-        # 將視窗屬性設定為 toolwindow，這會隱藏掉 Taskbar 上的圖示
-        self.root.wm_attributes("-toolwindow", True)  
+        try:
+            logger.info("正在初始化 DesktopCalendar...")
+            self.root = root
+            self.root.title("DesktopCalendar v1.2")
+            # 將視窗屬性設定為 toolwindow，這會隱藏掉 Taskbar 上的圖示
+            self.root.wm_attributes("-toolwindow", True)  
 
-        # 資料路徑改為 .config 以降低防毒軟體誤報
-        self.data_path = "tasks.config"
-        self.old_data_path = "tasks.json"
-        # 依照 JSON 檔案載入上次保存的位置或記事資料
-        self.load_data()
-        # 基於載入的設定，計算與初始化目前的 UI 色票組合
-        self._rebuild_theme()
-        # 立即設定根視窗底色，避免 Tkinter 預設色背景在載入時閃爍白框
-        self.root.config(bg=self.theme["bg"])
+            # 資料路徑改為 .config 以降低防毒軟體誤報
+            base = get_base_dir()
+            self.data_path = os.path.join(base, "tasks.config")
+            self.old_data_path = os.path.join(base, "tasks.json")
+            # 依照 JSON 檔案載入上次保存的位置或記事資料
+            self.load_data()
+            # 基於載入的設定，計算與初始化目前的 UI 色票組合
+            self._rebuild_theme()
+            # 立即設定根視窗底色，避免 Tkinter 預設色背景在載入時閃爍白框
+            self.root.config(bg=self.theme["bg"])
 
-        self.week_offset    = 0          # 0 = 當週; 正數/負數 = 偏移幾週的顯示
-        self._drag          = {"x": 0, "y": 0}
-        self._resize_start  = None
+            self.week_offset    = 0          # 0 = 當週; 正數/負數 = 偏移幾週的顯示
+            self._drag          = {"x": 0, "y": 0}
+            self._resize_start  = None
 
-        self.setup_window()
-        self.create_widgets()
-        
-        # 這是 DesktopCalendar 最關鍵的環節：將視窗釘在 Windows 桌面底層 (Desktop Layer)
-        self.apply_desktop_layer()
-        self.setup_tray()
-        
-        self._resize_job  = None
-        self._last_size   = (0, 0)
-        self.root.bind("<Configure>", self._on_configure)
-        
-        # 強制在主迴圈啟動前，完成所有的版面幾何運算與渲染
-        # 這是為了解決剛啟動時按鈕未對齊或出現白邊的問題
-        self.root.update_idletasks()
+            self.setup_window()
+            self.create_widgets()
+            
+            # 這是 DesktopCalendar 最關鍵的環節：將視窗釘在 Windows 桌面底層 (Desktop Layer)
+            self.apply_desktop_layer()
+            self.setup_tray()
+            
+            self._resize_job  = None
+            self._last_size   = (0, 0)
+            self.root.bind("<Configure>", self._on_configure)
+            
+            # 強制在主迴圈啟動前，完成所有的版面幾何運算與渲染
+            # 這是為了解決剛啟動時按鈕未對齊或出現白邊的問題
+            self.root.update_idletasks()
+            logger.info("DesktopCalendar 初始化完成。")
+            
+            # 初始化時同步一次登錄檔 (確保位置正確)
+            if self.settings.get("autostart", False):
+                self._update_autostart_registry(True)
+            
+            # 強制全面更新，解決 Win7 部分元件需要 hover 才出現的問題
+            self.root.update()
+            # 延後執行刷新，避開開機時的最尖峰負載
+            self.root.after(2000, self._super_refresh)
+            self.root.after(5000, self._super_refresh)
+        except Exception as e:
+            logger.error(f"初始化失敗: {e}", exc_info=True)
+            messagebox.showerror("啟動錯誤", f"程式初始化失敗: {e}")
+            sys.exit(1)
+
+    def _super_refresh(self):
+        """強制重新渲染：補強 Win7 渲染延遲問題，但不改動視窗大小以防異常"""
+        try:
+            # 僅在視窗可見時執行重新套用樣式
+            if self.root.winfo_viewable():
+                self._restyle_all()
+                self.draw_calendar()
+                self.root.update_idletasks()
+                logger.debug("已執行介面刷新")
+        except Exception:
+            pass
 
     def _on_configure(self, event):
         """
@@ -615,6 +675,42 @@ class DesktopCalendar:
         # Re-apply desktop z-order
         self.apply_desktop_layer()
 
+    def _update_autostart_registry(self, enable):
+        """更新 Windows 登錄檔啟動項目"""
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "DesktopCalendar"
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+            if enable:
+                # 取得目前執行檔的絕對路徑
+                exe_path = os.path.abspath(sys.executable)
+                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
+                logger.info(f"已加入開機啟動登錄檔: {exe_path}")
+            else:
+                try:
+                    winreg.DeleteValue(key, app_name)
+                    logger.info("已移除開機啟動登錄檔項目")
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception as e:
+            logger.error(f"更新登錄檔失敗: {e}", exc_info=True)
+
+    def apply_settings(self):
+        """套用設定對話框回傳的新數值並儲存至磁碟。"""
+        self._rebuild_theme()
+        # 更新背景色
+        self.root.config(bg=self.theme["bg"])
+        self.container.config(bg=self.theme["bg"])
+        self.header.config(bg=self.theme["header_bg"])
+        self.month_lbl.config(bg=self.theme["header_bg"])
+        self.nav_frame.config(bg=self.theme["header_bg"])
+        self.btn_gear.config(bg=self.theme["header_bg"])
+        
+        self.save_data()
+        self.draw_calendar()
+        self._update_autostart_registry(self.settings.get("autostart", False))
+
     # ── Theme ─────────────────────────────────────────────────────────────────
 
     def _rebuild_theme(self):
@@ -638,8 +734,10 @@ class DesktopCalendar:
         try:
             h = hex_color.lstrip("#")
             r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
-            return f"#{min(255,r+d):02x}{min(255,g+d):02x}{min(255,b+d):02x}"
-        except Exception:
+            def clamp(val): return max(0, min(255, val))
+            return f"#{clamp(r+d):02x}{clamp(g+d):02x}{clamp(b+d):02x}"
+        except Exception as e:
+            logger.debug(f"顏色轉換失敗 ({hex_color}): {e}")
             return hex_color
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -681,16 +779,21 @@ class DesktopCalendar:
         包含目前的視窗位置 (pos_x, pos_y) 與縮放大小，以及行事曆內的記事。
         """
         try:
+            logger.info(f"正在儲存資料至 {os.path.abspath(self.data_path)}...")
             self.settings["pos_x"]  = self.root.winfo_x()
             self.settings["pos_y"]  = self.root.winfo_y()
             self.settings["width"]  = self.root.winfo_width()
             self.settings["height"] = self.root.winfo_height()
             self.data["settings"] = self.settings
             self.data["tasks"]    = self.tasks
+            
             with open(self.data_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
+            logger.info("資料儲存成功。")
         except Exception as e:
-            logger.error(f"儲存資料失敗: {e}", exc_info=True)
+            logger.error(f"儲存資料失敗 (Path: {self.data_path}): {e}", exc_info=True)
+            # 只有在 save_data 被直接呼叫（非 exit_app）時才顯示錯誤框？
+            # 這裡還是保留 logger.error 即可，外部呼叫處會處理
 
     # ── Window ────────────────────────────────────────────────────────────────
 
@@ -768,21 +871,25 @@ class DesktopCalendar:
         self.btn_gear = tk.Button(self.nav_frame, text="⚙",
                                   command=self.open_settings,
                                   bg=self.theme["header_bg"], fg="#c8e6f5", bd=0,
-                                  font=("Arial", 13),
+                                  font=("Arial", 13), relief="flat",
                                   activebackground=self.theme["header_bg"])
         self.btn_gear.pack(side=tk.LEFT, padx=2)
 
         self.btn_prev = tk.Button(self.nav_frame, text="‹", command=self.prev_month,
                                   bg=self.theme["header_bg"], fg="white", bd=0,
-                                  font=("Arial", 15),
+                                  font=("Arial", 15), relief="flat",
                                   activebackground=self.theme["header_bg"])
         self.btn_prev.pack(side=tk.LEFT)
 
         self.btn_next = tk.Button(self.nav_frame, text="›", command=self.next_month,
                                   bg=self.theme["header_bg"], fg="white", bd=0,
-                                  font=("Arial", 15),
+                                  font=("Arial", 15), relief="flat",
                                   activebackground=self.theme["header_bg"])
         self.btn_next.pack(side=tk.LEFT, padx=4)
+        
+        # 強制刷新頂部區塊，避免按鈕在啟動時消失 (直到滑鼠移入才現身)
+        self.header.update_idletasks()
+        self.nav_frame.update()
 
         # Calendar grid
         self.grid_frame = tk.Frame(self.container, bg=self.theme["bg"])
@@ -846,116 +953,120 @@ class DesktopCalendar:
         核心渲染邏輯：清空舊有的日曆網格，並根據 _get_weeks() 繪製最新月份與內容。
         處理包含跨月反灰、今日高亮、以及截斷預覽太長的記事項目。
         """
-        for w in self.grid_frame.winfo_children():
-            w.destroy()
+        try:
+            for w in self.grid_frame.winfo_children():
+                w.destroy()
             
-        today = date.today()
-        weeks = self._get_weeks()
+            today = date.today()
+            weeks = self._get_weeks()
 
-        # ── 解析並渲染 Header 標題列 (例如 "2024年 3月 / 4月") ──
-        months_seen = []
-        for week in weeks:
-            for d in week:
-                key = (d.year, d.month)
-                if key not in months_seen:
-                    months_seen.append(key)
-                    
-        # 若當前 6 週都落在同一個月份內
-        if len(months_seen) == 1:
-            y, m = months_seen[0]
-            header_text = f"{y}年 {m}月"
-        # 若畫面出現跨月 (甚至跨年) 的情況
-        else:
-            parts = []
-            prev_year = None
-            for y, m in months_seen:
-                if y != prev_year:
-                    parts.append(f"{y}年 {m}月")
-                    prev_year = y
-                else:
-                    parts.append(f"{m}月")
-            header_text = " / ".join(parts)
-        self.month_lbl.config(text=header_text)
-
-        # ── 繪製星期標題列 (一~日) ──
-        for i, d in enumerate(["一","二","三","四","五","六","日"]):
-            tk.Label(self.grid_frame, text=d, font=("Microsoft JhengHei", 9),
-                     bg=self.theme["bg"], fg="#c8e6f5").grid(
-                row=0, column=i, sticky="nsew", pady=4)
-
-        # ── 迴圈繪製 42 宮格的日期與內容 ──
-        for r, week in enumerate(weeks):
-            for c, day_date in enumerate(week):
-                date_str  = day_date.strftime("%Y-%m-%d")
-                raw_note  = self.tasks.get(date_str, None)
-                note_text = self._note_text(raw_note) if raw_note else ""
-                has_note  = bool(note_text)
-                is_today  = (day_date == today)
-                
-                # 判定跨月淡化顯示：以畫面上第一週的週一作為主要月份判定基準
-                dominant_month = week[0].month
-                is_other_month = (day_date.month != dominant_month)
-                
-                # 若該天有記事，替網格加上亮底色
-                cell_bg   = self._shift(self.theme["grid_bg"], 18) if has_note else self.theme["grid_bg"]
-                
-                # 字體顏色邏輯：今日 (金黃) > 非本月 (暗灰) > 正常 (白)
-                if is_today:
-                    day_fg = self.theme["highlight"]
-                elif is_other_month:
-                    day_fg = "#7ab0cc"   
-                else:
-                    day_fg = "white"
-                    
-                # 只有在月初 (1號) 時，額外顯示月份標籤 (除了整個畫面的第一格之外)
-                if day_date.day == 1 and not (r == 0 and c == 0):
-                    day_label = f"{day_date.month}/{day_date.day}"
-                else:
-                    day_label = str(day_date.day)
-                    
-                cell = tk.Frame(self.grid_frame, bg=cell_bg,
-                                highlightbackground="#a0d8ef",
-                                highlightthickness=1 if (is_today or has_note) else 0)
-                cell.grid(row=r+1, column=c, sticky="nsew", padx=1, pady=1)
-                
-                # 放上左上角的日期數字
-                tk.Label(cell, text=day_label, font=("Arial", 10, "bold"),
-                         bg=cell_bg, fg=day_fg).pack(anchor="nw", padx=2, pady=1)
-                         
-                # ── 繪製最多三行的濃縮預覽記事 ──
-                if has_note:
-                    note_lines = parse_note_lines(raw_note)
-                    sz_map = {"小": 7, "中": 8, "大": 10}
-                    wrap   = self._cell_wrap_width()
-                    
-                    for idx, ln in enumerate(note_lines[:3]):
-                        sz      = sz_map.get(ln.get("size", "中"), 8)
-                        weight  = "bold" if ln.get("bold") else "normal"
-                        justify = ln.get("align", "left")
-                        anchor  = {"left": "w", "center": "center", "right": "e"}.get(justify, "w")
-                        fg_col  = ln.get("color", "#dff0ff")
+            # ── 解析並渲染 Header 標題列 (例如 "2024年 3月 / 4月") ──
+            months_seen = []
+            for week in weeks:
+                for d in week:
+                    key = (d.year, d.month)
+                    if key not in months_seen:
+                        months_seen.append(key)
                         
-                        tk.Label(cell, text=f"• {ln['text']}",
-                                 font=("Microsoft JhengHei", sz, weight),
-                                 bg=cell_bg, fg=fg_col,
-                                 justify=justify, anchor=anchor,
-                                 wraplength=wrap).pack(fill=tk.X, padx=2, anchor=anchor)
-                                 
-                    # 若超過三行，顯示省略提示
-                    if len(note_lines) > 3:
-                        tk.Label(cell, text=f"  …(+{len(note_lines)-3})",
-                                 font=("Microsoft JhengHei", 7),
-                                 bg=cell_bg, fg="#dff0ff").pack(fill=tk.X, padx=2, anchor="w")
-                                 
-                # 綁定雙擊事件：不論是點擊外框或是內部元件，皆觸發編輯視窗
-                cell.bind("<Double-Button-1>", lambda e, d=date_str: self.edit_note(d))
-                for ch in cell.winfo_children():
-                    ch.bind("<Double-Button-1>", lambda e, d=date_str: self.edit_note(d))
+            # 若當前 6 週都落在同一個月份內
+            if len(months_seen) == 1:
+                y, m = months_seen[0]
+                header_text = f"{y}年 {m}月"
+            # 若畫面出現跨月 (甚至跨年) 的情況
+            else:
+                parts = []
+                prev_year = None
+                for y, m in months_seen:
+                    if y != prev_year:
+                        parts.append(f"{y}年 {m}月")
+                        prev_year = y
+                    else:
+                        parts.append(f"{m}月")
+                header_text = " / ".join(parts)
+            self.month_lbl.config(text=header_text)
 
-        for i in range(7):
-            self.grid_frame.grid_columnconfigure(i, weight=1)
-        for i in range(1, 8):
-            self.grid_frame.grid_rowconfigure(i, weight=1)
+            # ── 繪製星期標題列 (一~日) ──
+            for i, d in enumerate(["一","二","三","四","五","六","日"]):
+                tk.Label(self.grid_frame, text=d, font=("Microsoft JhengHei", 9),
+                         bg=self.theme["bg"], fg="#c8e6f5").grid(
+                    row=0, column=i, sticky="nsew", pady=4)
+
+            # ── 迴圈繪製 42 宮格的日期與內容 ──
+            for r, week in enumerate(weeks):
+                for c, day_date in enumerate(week):
+                    date_str  = day_date.strftime("%Y-%m-%d")
+                    raw_note  = self.tasks.get(date_str, None)
+                    note_text = self._note_text(raw_note) if raw_note else ""
+                    has_note  = bool(note_text)
+                    is_today  = (day_date == today)
+                    
+                    # 判定跨月淡化顯示：以畫面上第一週的週一作為主要月份判定基準
+                    dominant_month = week[0].month
+                    is_other_month = (day_date.month != dominant_month)
+                    
+                    # 若該天有記事，替網格加上亮底色
+                    cell_bg   = self._shift(self.theme["grid_bg"], 18) if has_note else self.theme["grid_bg"]
+                    
+                    # 字體顏色邏輯：今日 (金黃) > 非本月 (暗灰) > 正常 (白)
+                    if is_today:
+                        day_fg = self.theme["highlight"]
+                    elif is_other_month:
+                        day_fg = "#7ab0cc"   
+                    else:
+                        day_fg = "white"
+                        
+                    # 只有在月初 (1號) 時，額外顯示月份標籤 (除了整個畫面的第一格之外)
+                    if day_date.day == 1 and not (r == 0 and c == 0):
+                        day_label = f"{day_date.month}/{day_date.day}"
+                    else:
+                        day_label = str(day_date.day)
+                        
+                    cell = tk.Frame(self.grid_frame, bg=cell_bg,
+                                    highlightbackground="#a0d8ef",
+                                    highlightthickness=1 if (is_today or has_note) else 0)
+                    cell.grid(row=r+1, column=c, sticky="nsew", padx=1, pady=1)
+                    
+                    # 放上左上角的日期數字
+                    tk.Label(cell, text=day_label, font=("Arial", 10, "bold"),
+                             bg=cell_bg, fg=day_fg).pack(anchor="nw", padx=2, pady=1)
+                             
+                    # ── 繪製最多三行的濃縮預覽記事 ──
+                    if has_note:
+                        note_lines = parse_note_lines(raw_note)
+                        sz_map = {"小": 7, "中": 8, "大": 10}
+                        wrap   = self._cell_wrap_width()
+                        
+                        for idx, ln in enumerate(note_lines[:3]):
+                            sz      = sz_map.get(ln.get("size", "中"), 8)
+                            weight  = "bold" if ln.get("bold") else "normal"
+                            justify = ln.get("align", "left")
+                            anchor  = {"left": "w", "center": "center", "right": "e"}.get(justify, "w")
+                            fg_col  = ln.get("color", "#dff0ff")
+                            
+                            tk.Label(cell, text=f"• {ln['text']}",
+                                     font=("Microsoft JhengHei", sz, weight),
+                                     bg=cell_bg, fg=fg_col,
+                                     justify=justify, anchor=anchor,
+                                     wraplength=wrap).pack(fill=tk.X, padx=2, anchor=anchor)
+                                     
+                        # 若超過三行，顯示省略提示
+                        if len(note_lines) > 3:
+                            tk.Label(cell, text=f"  …(+{len(note_lines)-3})",
+                                     font=("Microsoft JhengHei", 7),
+                                     bg=cell_bg, fg="#dff0ff").pack(fill=tk.X, padx=2, anchor="w")
+                                     
+                    # 綁定雙擊事件：不論是點擊外框或是內部元件，皆觸發編輯視窗
+                    cell.bind("<Double-Button-1>", lambda e, d=date_str: self.edit_note(d))
+                    for ch in cell.winfo_children():
+                        ch.bind("<Double-Button-1>", lambda e, d=date_str: self.edit_note(d))
+
+            for i in range(7):
+                self.grid_frame.grid_columnconfigure(i, weight=1)
+            for i in range(1, 8):
+                self.grid_frame.grid_rowconfigure(i, weight=1)
+        except Exception as e:
+            logger.error(f"draw_calendar 渲染失敗: {e}", exc_info=True)
+            # 視需要顯示錯誤訊息給使用者
 
     # ── Drag / Resize ─────────────────────────────────────────────────────────
 
@@ -994,16 +1105,22 @@ class DesktopCalendar:
         return "\n".join(ln["text"] for ln in lines)
 
     def edit_note(self, date_str):
-        raw = self.tasks.get(date_str, {})
-        dlg = NoteDialog(self.root, date_str, raw, self.theme)
-        if dlg.result is not None:
-            lines = dlg.result.get("lines", [])
-            if lines:
-                self.tasks[date_str] = dlg.result
-            else:
-                self.tasks.pop(date_str, None)
-            self.save_data()
-            self.draw_calendar()
+        try:
+            logger.info(f"開啟記事編輯: {date_str}")
+            raw = self.tasks.get(date_str, {})
+            dlg = NoteDialog(self.root, date_str, raw, self.theme)
+            if dlg.result is not None:
+                lines = dlg.result.get("lines", [])
+                if lines:
+                    self.tasks[date_str] = dlg.result
+                else:
+                    self.tasks.pop(date_str, None)
+                self.save_data()
+                self.draw_calendar()
+                logger.info(f"記事編輯完成並已儲存: {date_str}")
+        except Exception as e:
+            logger.error(f"編輯記事失敗 ({date_str}): {e}", exc_info=True)
+            messagebox.showerror("錯誤", f"無法編輯記事: {e}")
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -1028,16 +1145,13 @@ class DesktopCalendar:
             self.draw_calendar()
             self.root.attributes("-alpha", self.settings["edit_opacity"])
 
-        def apply():
-            self.save_data()
-
         def cancel():
             self._rebuild_theme()
             self._restyle_all()
             self.draw_calendar()
             self.root.attributes("-alpha", self.settings["edit_opacity"])
 
-        SettingsDialog(self.root, self.settings, live, apply, cancel,
+        SettingsDialog(self.root, self.settings, live, self.apply_settings, cancel,
                        self.import_data, self.export_data)
 
     # ── Import / Export ───────────────────────────────────────────────────────
@@ -1046,22 +1160,30 @@ class DesktopCalendar:
         """
         將日曆的 JSON 結構匯出存為額外備份擋案。
         """
-        path = filedialog.asksaveasfilename(defaultextension=".json",
-                                            filetypes=[("JSON","*.json")],
-                                            title="匯出行事曆")
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
-            messagebox.showinfo("完成", "匯出成功。")
+        try:
+            path = filedialog.asksaveasfilename(defaultextension=".json",
+                                                filetypes=[("JSON","*.json")],
+                                                title="匯出行事曆")
+            if path:
+                logger.info(f"正在匯出資料至 {path}...")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, indent=2, ensure_ascii=False)
+                messagebox.showinfo("完成", "匯出成功。")
+                logger.info("資料匯出成功。")
+        except Exception as e:
+            logger.error(f"匯出資料失敗: {e}", exc_info=True)
+            messagebox.showerror("錯誤", f"匯出失敗: {e}")
 
     def import_data(self):
         """
         從外部 JSON 檔案讀取記事，並詢問合併或取代目前行事曆。
         """
-        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")], title="匯入行事曆")
-        if not path:
-            return
         try:
+            path = filedialog.askopenfilename(filetypes=[("JSON","*.json")], title="匯入行事曆")
+            if not path:
+                return
+            
+            logger.info(f"正在從 {path} 匯入資料...")
             with open(path, "r", encoding="utf-8") as f:
                 new = json.load(f)
                 
@@ -1069,16 +1191,21 @@ class DesktopCalendar:
             choice = messagebox.askyesnocancel("匯入", "「是」合併　「否」取代　「取消」放棄")
             if choice is True:
                 self.tasks.update(new.get("tasks", {}))
+                logger.info("使用者選擇合併資料。")
             elif choice is False:
                 self.tasks = new.get("tasks", {})
+                logger.info("使用者選擇取代資料。")
             else:
+                logger.info("使用者取消匯入作業。")
                 return
                 
             self.save_data()
             self.draw_calendar()
             messagebox.showinfo("完成", "匯入成功。")
+            logger.info("資料匯入成功。")
         except Exception as e:
-            messagebox.showerror("錯誤", str(e))
+            logger.error(f"匯入資料失敗: {e}", exc_info=True)
+            messagebox.showerror("錯誤", f"匯入失敗: {e}")
 
     # ── Tray (工作列圖示) ─────────────────────────────────────────────────────
 
@@ -1113,12 +1240,28 @@ class DesktopCalendar:
         threading.Thread(target=self.tray.run, daemon=True).start()
 
     def exit_app(self, *_):
-        self.save_data()
+        logger.info("正在關閉應用程式...")
         try:
-            self.tray.stop()
-        except Exception:
-            pass
-        self.root.destroy()
+            self.save_data()
+        except Exception as e:
+            logger.error(f"關閉前存檔失敗: {e}", exc_info=True)
+
+        try:
+            if hasattr(self, 'tray'):
+                logger.info("正在停止系統小圖示 (Tray)...")
+                self.tray.visible = False
+                self.tray.stop()
+        except Exception as e:
+            logger.error(f"停止小圖示失敗: {e}", exc_info=True)
+
+        try:
+            logger.info("正在銷毀視窗並結束行程...")
+            self.root.destroy()
+        except Exception as e:
+            logger.error(f"銷毀視窗失敗: {e}", exc_info=True)
+        finally:
+            # 確保行程完全終止，避免殘留執行緒導致圖示無法消失
+            os._exit(0)
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────

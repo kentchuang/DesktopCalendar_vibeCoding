@@ -5,17 +5,17 @@
 - **高安全性**：為符合內部安全政策，排除特定區域開發之第三方套件與服務。
 - **純在地執行**：不具備任何網路連線功能，確保數據絕對隱私。
 - **輕量免安裝**：採用原生技術，釘選於桌面底座，不干擾日常作業。
-- **錯誤診斷**：內建 Logging 機制，自動記錄運作異常於 `app.log`。
+- **錯誤診斷**：內建 Logging 機制，自動記錄運作異常於執行檔目錄下的 `app.log`。
 
 ## 2. 核心技術指標
 | 項目 | 規格 |
 |---|---|
-| 語言環境 | Python 3.14.3 (建議環境) |
+| 語言環境 | Python 3.8.10 (建議環境，相容 Windows 7) |
 | GUI 框架 | Tkinter + colorchooser (色盤) |
 | 影像處理 | Pillow (系統匣圖示) |
 | 系統匣整合 | pystray |
 | 系統介面 | Windows API (ctypes) |
-| 部署方式 | 單一 .exe 執行檔，免安裝 |
+| 部署方式 | 目錄形式 (`--onedir`) 執行檔，降低防毒誤判 |
 | 資料儲存 | 本地 tasks.config，避免防毒誤判 |
 
 ## 3. 核心功能
@@ -44,6 +44,7 @@
 | 設定項目 | 說明 |
 |---|---|
 | **透明度** | 滑桿調整 30%~100%，**拖拽時即時預覽** |
+| **啟動選項** | 勾選「開機時自動啟動」可將程式加入系統啟動清單 |
 | **日曆底色** | 系統色盤選色，變更後**日曆所有元件同步更新** |
 | **匯入行事曆** | 讀取外部設定檔，可選擇合併或取代 |
 | **匯出行事曆** | 備份資料至外部設定檔 |
@@ -67,13 +68,15 @@
 ## 6. 打包規範 (Building)
 執行 `build.bat` 即可一鍵打包：
 ```bash
-python -m PyInstaller --onefile --noconsole --noupx --name="DesktopCalendar" main.py
+python -m PyInstaller --onedir --noconsole --noupx --name="DesktopCalendar" main.py
 ```
-> **依賴套件**：`pip install pillow pystray`
+> **依賴套件**：`pip install pyinstaller pillow pystray`
 
 ## 7. 排除項目 (Out of Scope)
 - 排除特定敏感區域開發之第三方套件或函式庫，確保合規性。
 - 不支援雲端同步，維持單機作業以確保資訊安全。
 - 不使用 Electron、.NET 等重型框架。
-- 注意：自 Python 3.9+ 起不再支援 Windows 7。執行本版本需 Windows 10 或更高版本。
+- **作業系統相容性**：
+    - 建議環境：Windows 10 或更高版本。
+    - **Windows 7 支援**：雖然 Python 3.9+ 官方不支援 Windows 7，但本專案透過包含 `api-ms-win-core-path-l1-1-0.dll` 並修正路徑權限，仍可在 Windows 7 上正常運作。
 
